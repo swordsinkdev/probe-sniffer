@@ -2,19 +2,15 @@
 //!
 //! ## Approach
 //!
-//! 1. Detect the WiFi interface via `networksetup -listallhardwareports`.
-//! 2. Bring the interface down with `ifconfig <iface> down`.
-//! 3. Enable monitor mode:  `ifconfig <iface> monitor`.
-//! 4. Set the channel:      `ifconfig <iface> channel <N>`.
-//! 5. Bring the interface up: `ifconfig <iface> up`.
-//!
-//! All of these require **root** (`sudo`).  The binary will exit with a
-//! clear error message if the commands fail due to insufficient privileges.
+//! Monitor mode must be enabled **manually** by the user before launching
+//! this tool (e.g. via Wireless Diagnostics, `wdutil`, or a third-party
+//! tool like `iw`/KisMac).  This module only detects the WiFi interface
+//! and verifies that it is already in monitor mode.
 //!
 //! ## Teardown
 //!
-//! `disable_monitor_mode` removes monitor mode and re-associates with the
-//! previous network by toggling Wi-Fi power via `networksetup`.
+//! `disable_monitor_mode` toggles Wi-Fi power via `networksetup` to
+//! re-associate with the previous network.
 
 use std::io;
 use std::process::Command;
@@ -73,19 +69,33 @@ impl WifiMonitor for MacOsMonitor {
     }
 
     fn enable_monitor_mode(&self, iface: &str, channel: u8) -> io::Result<()> {
-        log::info!("Bringing {iface} down …");
-        Self::run("ifconfig", &[iface, "down"])?;
+        // Verify the interface is already in monitor mode by checking
+        // `ifconfig <iface>` output for the "MONITOR" flag.
+        log::info!("Checking that {iface} is already in monitor mode …");
+        let output = Self::run("ifconfig", &[iface])?;
+        if !output.to_uppercase().contains("MONITOR") {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "{iface} is NOT in monitor mode.\n\
+                     Please enable monitor mode manually before running this tool.\n\
+                     \n\
+                     Example (macOS Sonoma+):\n\
+                     \n\
+                     # Option A — Wireless Diagnostics:\n\
+                     #   Open Wireless Diagnostics → Window → Sniffer\n\
+                     #   Select channel {channel}, width 20 MHz, and capture.\n\
+                     \n\
+                     # Option B — wdutil (requires SIP adjustment):\n\
+                     #   sudo wdutil sniff --channel {channel} --width 20\n\
+                     \n\
+                     Then re-run this tool."
+                ),
+            ));
+        }
 
-        log::info!("Enabling monitor mode on {iface} …");
-        Self::run("ifconfig", &[iface, "monitor"])?;
-
-        log::info!("Setting channel {channel} on {iface} …");
-        let ch = channel.to_string();
-        Self::run("ifconfig", &[iface, "channel", &ch])?;
-
-        log::info!("Bringing {iface} up …");
-        Self::run("ifconfig", &[iface, "up"])?;
-
+        log::info!("{iface} is in monitor mode ✓");
+        log::info!("Note: make sure you have set channel {channel} (20 MHz) manually.");
         Ok(())
     }
 
