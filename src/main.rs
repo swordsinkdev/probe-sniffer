@@ -12,13 +12,19 @@
 //!
 //! | Platform | Prerequisites |
 //! |----------|---------------|
-//! | macOS    | Run as **root** (`sudo`).  Uses `ifconfig` to enable monitor mode (no `airport` CLI needed). |
+//! | macOS    | Run as **root** (`sudo`).  Enable monitor mode manually before running. |
 //! | Windows  | Install **Npcap** with *"Support raw 802.11 traffic"* enabled.  Run as **Administrator**. |
 //!
 //! ## Examples
 //!
 //! ```text
+//! # List available capture interfaces:
+//! cargo run -- --list-interfaces
+//!
+//! # Sniff on auto-detected interface:
 //! sudo cargo run -- --ssid "MyNetwork"
+//!
+//! # Sniff on a specific interface and channel:
 //! sudo cargo run -- --ssid "MyNetwork" --channel 6 --interface en0
 //! ```
 
@@ -37,9 +43,13 @@ use clap::Parser;
 #[command(name = "probe-sniffer")]
 #[command(version, about = "WiFi probe request sniffer with signal-strength device clustering")]
 struct Cli {
+    /// List all available capture interfaces and exit.
+    #[arg(short = 'l', long)]
+    list_interfaces: bool,
+
     /// Target SSID to filter for.
-    #[arg(short, long)]
-    ssid: String,
+    #[arg(short, long, required_unless_present = "list_interfaces")]
+    ssid: Option<String>,
 
     /// WiFi channel to sniff (1–14 for 2.4 GHz, 36–165 for 5 GHz).
     #[arg(short, long, default_value_t = 8)]
@@ -78,6 +88,17 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // ── List interfaces mode ────────────────────────────────────────────
+    if cli.list_interfaces {
+        if let Err(e) = capture::list_interfaces() {
+            log::error!("Failed to list interfaces: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let ssid = cli.ssid.expect("SSID is required when not using --list-interfaces");
 
     // ── Platform setup ──────────────────────────────────────────────────
     let monitor = platform::create_monitor();
@@ -123,7 +144,7 @@ fn main() {
     // ── Capture loop ────────────────────────────────────────────────────
     let capture_cfg = capture::CaptureConfig {
         interface: iface.clone(),
-        ssid: cli.ssid,
+        ssid,
         channel: cli.channel,
         channel_width: cli.channel_width,
         cluster_cfg: cluster::ClusterConfig {

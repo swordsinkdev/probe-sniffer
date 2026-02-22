@@ -28,35 +28,110 @@ pub struct CaptureConfig {
     pub cluster_cfg: ClusterConfig,
 }
 
+/// List all pcap-visible interfaces with their descriptions.
+pub fn list_interfaces() -> Result<(), Box<dyn std::error::Error>> {
+    let devices = Device::list()?;
+    if devices.is_empty() {
+        println!("  No capture interfaces found. Is Npcap/libpcap installed?");
+        return Ok(());
+    }
+    println!("\n  {:<6} {:<45} {}", "#", "Name", "Description");
+    println!("  {}", "-".repeat(90));
+    for (i, dev) in devices.iter().enumerate() {
+        let desc = dev.desc.as_deref().unwrap_or("(no description)");
+        println!("  {:<6} {:<45} {}", i, dev.name, desc);
+    }
+    println!();
+    Ok(())
+}
+
 /// Run the capture loop until interrupted.
 pub fn run(cfg: CaptureConfig, running: Arc<AtomicBool>) -> Result<(), Box<dyn std::error::Error>> {
-    // Open the interface in promiscuous + immediate mode.
+    // Open the interface with rfmon (monitor mode) requested via libpcap.
     let device = Device::from(cfg.interface.as_str());
 
-    let mut cap = Capture::from_device(device)?
+    let inactive = Capture::from_device(device)?
         .promisc(true)
         .snaplen(65535)
         .timeout(1000) // 1-second read timeout so we can check `running`
-        .immediate_mode(true)
-        .open()?;
+        .immediate_mode(true);
 
-    // Attempt to set monitor mode on the pcap handle (works on some systems).
-    // Errors are non-fatal — the platform layer already did its best.
+    // Request monitor mode via libpcap's pcap_set_rfmon().
+    // This is the proper cross-platform way to get raw 802.11 + radiotap.
+    // Note: rfmon() is not available on Windows (Npcap handles it differently).
     #[cfg(not(target_os = "windows"))]
-    {
-        if let Err(e) = cap.set_datalink(pcap::Linktype(127)) {
-            log::debug!("Could not request radiotap datalink via pcap: {e}");
+    let inactive = {
+        match inactive.rfmon(true) {
+            Ok(cap) => {
+                log::info!("Requested monitor mode (rfmon) via libpcap.");
+                cap
+            }
+            Err(e) => {
+                log::warn!(
+                    "Could not request rfmon via libpcap: {e}. \
+                     Will try to capture anyway — you may need to enable \
+                     monitor mode manually."
+                );
+                // Re-create without rfmon.
+                let dev2 = Device::from(cfg.interface.as_str());
+                Capture::from_device(dev2)?
+                    .promisc(true)
+                    .snaplen(65535)
+                    .timeout(1000)
+                    .immediate_mode(true)
+            }
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    let inactive = {
+        log::info!("Skipping rfmon (not supported on Windows — Npcap handles monitor mode).");
+        inactive
+    };
+
+    let mut cap = inactive.open()?;
+
+    // Log all available datalink types for debugging.
+    let available_dlts: Vec<_> = cap
+        .list_datalinks()
+        .unwrap_or_default()
+        .iter()
+        .map(|l| (l.0, dlt_name(l.0)))
+        .collect();
+    log::info!("Available datalink types: {:?}", available_dlts);
+
+    // Try to set radiotap (DLT 127), then raw 802.11 (DLT 105).
+    if let Err(e) = cap.set_datalink(pcap::Linktype(127)) {
+        log::debug!("Could not set DLT_IEEE802_11_RADIO (127): {e}");
+        if let Err(e2) = cap.set_datalink(pcap::Linktype(105)) {
+            log::debug!("Could not set DLT_IEEE802_11 (105): {e2}");
         }
     }
 
     let dlt = cap.get_datalink().0;
-    log::info!("Datalink type: {dlt}");
+    log::info!("Active datalink type: {} ({})", dlt, dlt_name(dlt));
 
     if dlt != 127 && dlt != 105 {
-        log::warn!(
-            "Unexpected datalink type {dlt}. Expected 127 (Radiotap) or 105 (raw 802.11). \
-             Capture may not work correctly."
+        log::error!(
+            "Datalink type is {} ({}) — expected 127 (Radiotap) or 105 (raw 802.11).",
+            dlt,
+            dlt_name(dlt)
         );
+        log::error!(
+            "This means the interface is NOT in monitor mode. Possible fixes:"
+        );
+        log::error!("  • macOS: Enable monitor mode first via Wireless Diagnostics");
+        log::error!("    (Window → Sniffer), or `sudo wdutil sniff --channel N --width 20`.");
+        log::error!("  • Windows: Reinstall Npcap with 'Support raw 802.11 traffic'.");
+        log::error!("  • Use --list-interfaces to verify you picked the right adapter.");
+        log::error!("  • Use --interface <NAME> to specify the correct adapter.");
+        return Err(format!(
+            "Cannot capture probe requests with datalink type {} ({}). \
+             Monitor mode is required.",
+            dlt,
+            dlt_name(dlt)
+        )
+        .into());
     }
 
     // Optional BPF filter — try to pre-filter on type/subtype if possible.
@@ -150,4 +225,19 @@ fn handle_probe(probe: &ProbeRequest, target_ssid: &str, engine: &mut ClusterEng
         cluster_id,
         engine.device_count(),
     );
+}
+
+/// Human-readable name for common DLT values.
+fn dlt_name(dlt: i32) -> &'static str {
+    match dlt {
+        0 => "NULL/Loopback",
+        1 => "Ethernet (EN10MB)",
+        6 => "IEEE 802.5 Token Ring",
+        9 => "PPP",
+        12 => "Raw IP",
+        105 => "IEEE 802.11 (raw)",
+        127 => "IEEE 802.11 Radiotap",
+        119 => "IEEE 802.11 PrismHeader",
+        _ => "Unknown",
+    }
 }
