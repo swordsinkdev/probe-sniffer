@@ -61,26 +61,8 @@ pub fn run(cfg: CaptureConfig, running: Arc<AtomicBool>) -> Result<(), Box<dyn s
     // Note: rfmon() is not available on Windows (Npcap handles it differently).
     #[cfg(not(target_os = "windows"))]
     let inactive = {
-        match inactive.rfmon(true) {
-            Ok(cap) => {
-                log::info!("Requested monitor mode (rfmon) via libpcap.");
-                cap
-            }
-            Err(e) => {
-                log::warn!(
-                    "Could not request rfmon via libpcap: {e}. \
-                     Will try to capture anyway — you may need to enable \
-                     monitor mode manually."
-                );
-                // Re-create without rfmon.
-                let dev2 = Device::from(cfg.interface.as_str());
-                Capture::from_device(dev2)?
-                    .promisc(true)
-                    .snaplen(65535)
-                    .timeout(1000)
-                    .immediate_mode(true)
-            }
-        }
+        log::info!("Requesting monitor mode (rfmon) via libpcap.");
+        inactive.rfmon(true)
     };
 
     #[cfg(target_os = "windows")]
