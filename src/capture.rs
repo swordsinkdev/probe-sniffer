@@ -116,12 +116,14 @@ pub fn run(cfg: CaptureConfig, running: Arc<AtomicBool>) -> Result<(), Box<dyn s
         .into());
     }
 
-    // Optional BPF filter — try to pre-filter on type/subtype if possible.
-    // Not all platforms support this filter syntax on radiotap captures, so
-    // we swallow errors.
-    if let Err(e) = cap.filter("type mgt subtype probe-req", true) {
-        log::debug!("BPF filter not applied (will filter in software): {e}");
-    }
+    // NOTE: We intentionally do NOT apply a BPF filter here.
+    //
+    // The filter "type mgt subtype probe-req" is technically valid for
+    // DLT 127 (Radiotap), but on macOS the kernel BPF implementation
+    // often silently drops packets when this filter is applied on a
+    // monitor-mode interface.  Wireshark works around this by doing all
+    // 802.11 subtype filtering in user-space.  We do the same: accept
+    // ALL packets from libpcap and filter in our parser.
 
     println!(
         "\n{}",
@@ -141,11 +143,30 @@ pub fn run(cfg: CaptureConfig, running: Arc<AtomicBool>) -> Result<(), Box<dyn s
     let mut last_summary = Instant::now();
     let summary_interval = Duration::from_secs(5);
 
+    // Diagnostic counters.
+    let mut total_packets: u64 = 0;
+    let mut probe_requests: u64 = 0;
+    let mut matching_probes: u64 = 0;
+
     while running.load(Ordering::Relaxed) {
         match cap.next_packet() {
             Ok(packet) => {
+                total_packets += 1;
+
                 if let Some(probe) = parser::parse_probe_request(packet.data, dlt) {
-                    handle_probe(&probe, &cfg.ssid, &mut engine);
+                    probe_requests += 1;
+
+                    // Log every probe request at debug level for diagnostics.
+                    log::debug!(
+                        "Probe request: MAC={} SSID={:?} RSSI={:?}",
+                        parser::format_mac(&probe.source_mac),
+                        probe.ssid,
+                        probe.signal_dbm,
+                    );
+
+                    if handle_probe(&probe, &cfg.ssid, &mut engine) {
+                        matching_probes += 1;
+                    }
                 }
             }
             Err(pcap::Error::TimeoutExpired) => {
@@ -157,8 +178,15 @@ pub fn run(cfg: CaptureConfig, running: Arc<AtomicBool>) -> Result<(), Box<dyn s
             }
         }
 
-        // Periodic summary.
+        // Periodic summary + diagnostic counts.
         if last_summary.elapsed() >= summary_interval {
+            log::info!(
+                "Stats: {} raw packets, {} probe requests, {} matching SSID \"{}\"",
+                total_packets,
+                probe_requests,
+                matching_probes,
+                cfg.ssid,
+            );
             engine.print_summary(&cfg.ssid);
             last_summary = Instant::now();
         }
@@ -166,16 +194,20 @@ pub fn run(cfg: CaptureConfig, running: Arc<AtomicBool>) -> Result<(), Box<dyn s
 
     // Final summary.
     println!("\n{}", "  ── Final summary ──".bold().cyan());
+    println!(
+        "  {} raw packets captured, {} probe requests, {} matching SSID {:?}",
+        total_packets, probe_requests, matching_probes, cfg.ssid,
+    );
     engine.print_summary(&cfg.ssid);
 
     Ok(())
 }
 
-/// Process a single parsed probe request.
-fn handle_probe(probe: &ProbeRequest, target_ssid: &str, engine: &mut ClusterEngine) {
+/// Process a single parsed probe request. Returns `true` if it matched the target SSID.
+fn handle_probe(probe: &ProbeRequest, target_ssid: &str, engine: &mut ClusterEngine) -> bool {
     // Only consider probes for our target SSID (case-insensitive match).
     if !probe.ssid.eq_ignore_ascii_case(target_ssid) {
-        return;
+        return false;
     }
 
     let rssi = match probe.signal_dbm {
@@ -185,7 +217,7 @@ fn handle_probe(probe: &ProbeRequest, target_ssid: &str, engine: &mut ClusterEng
                 "Probe request from {} has no signal info — skipping",
                 parser::format_mac(&probe.source_mac)
             );
-            return;
+            return false;
         }
     };
 
@@ -207,6 +239,8 @@ fn handle_probe(probe: &ProbeRequest, target_ssid: &str, engine: &mut ClusterEng
         cluster_id,
         engine.device_count(),
     );
+
+    true
 }
 
 /// Human-readable name for common DLT values.
