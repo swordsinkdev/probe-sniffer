@@ -69,33 +69,21 @@ impl WifiMonitor for MacOsMonitor {
     }
 
     fn enable_monitor_mode(&self, iface: &str, channel: u8) -> io::Result<()> {
-        // Verify the interface is already in monitor mode by checking
-        // `ifconfig <iface>` output for the "MONITOR" flag.
-        log::info!("Checking that {iface} is already in monitor mode …");
-        let output = Self::run("ifconfig", &[iface])?;
-        if !output.to_uppercase().contains("MONITOR") {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "{iface} is NOT in monitor mode.\n\
-                     Please enable monitor mode manually before running this tool.\n\
-                     \n\
-                     Example (macOS Sonoma+):\n\
-                     \n\
-                     # Option A — Wireless Diagnostics:\n\
-                     #   Open Wireless Diagnostics → Window → Sniffer\n\
-                     #   Select channel {channel}, width 20 MHz, and capture.\n\
-                     \n\
-                     # Option B — wdutil (requires SIP adjustment):\n\
-                     #   sudo wdutil sniff --channel {channel} --width 20\n\
-                     \n\
-                     Then re-run this tool."
-                ),
-            ));
-        }
-
-        log::info!("{iface} is in monitor mode ✓");
-        log::info!("Note: make sure you have set channel {channel} (20 MHz) manually.");
+        // On modern macOS, `ifconfig` does NOT reliably show a "MONITOR" flag
+        // even when monitor mode is active.  We skip the check entirely and
+        // trust that the user has already enabled it.  If it isn't enabled,
+        // pcap will fail to capture radiotap frames and we'll get an obvious
+        // error at capture time.
+        log::info!(
+            "Assuming {iface} is already in monitor mode on channel {channel} (20 MHz)."
+        );
+        log::info!(
+            "If you haven't enabled monitor mode yet, stop now and do so first."
+        );
+        log::info!(
+            "Hint: use Wireless Diagnostics (Window → Sniffer) or \
+             `sudo wdutil sniff --channel {channel} --width 20`."
+        );
         Ok(())
     }
 
