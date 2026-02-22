@@ -80,6 +80,16 @@ struct Cli {
     /// long is considered gone.
     #[arg(short = 't', long, default_value_t = 60)]
     ttl_secs: u64,
+
+    /// Minimum number of probe requests before a cluster is reported as a
+    /// confirmed device.  Increase to prune noisy one-off readings.
+    #[arg(long, default_value_t = 3)]
+    min_probes: u64,
+
+    /// Minimum confidence score (0.0–∞) to report a cluster as a real device.
+    /// Higher values prune transient or weak clusters.
+    #[arg(long, default_value_t = 0.5)]
+    min_confidence: f64,
 }
 
 fn main() {
@@ -152,6 +162,8 @@ fn main() {
             tx_power: cli.tx_power,
             path_loss_exp: cli.path_loss_exp,
             ttl: Duration::from_secs(cli.ttl_secs),
+            min_probes: cli.min_probes,
+            min_confidence: cli.min_confidence,
         },
     };
 
