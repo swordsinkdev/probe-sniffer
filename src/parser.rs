@@ -14,6 +14,47 @@ pub struct ProbeRequest {
     pub signal_dbm: Option<i8>,
     /// Channel frequency in MHz (from Radiotap header), if available.
     pub channel_freq: Option<u16>,
+    /// Information-element (IE) fingerprint for device identification
+    /// despite MAC randomization.  See [`IeFingerprint`].
+    pub ie_fingerprint: Option<IeFingerprint>,
+}
+
+/// A fingerprint derived from the Information Elements (IEs) embedded
+/// in a probe request frame body.
+///
+/// Research shows that the order and contents of IEs are highly
+/// device-specific and persist across MAC address changes, making them
+/// effective for tracking and de-randomization:
+///
+/// - Martin et al., *"Defeating MAC Address Randomization Through
+///   Timing Attacks"*, WiSec 2016, demonstrated that IE order +
+///   supported-rate sets uniquely identify device models and often
+///   individual devices.
+/// - Matte et al., *"Decomposition of MAC address structure for
+///   granular device inference"*, 2017, showed that the combination
+///   of tag ordering, HT capabilities, and vendor-specific IEs
+///   creates a near-unique per-model signature.
+///
+/// The fingerprint is a compact hash of:
+/// 1. Ordered list of IE tag numbers (e.g. `[0, 1, 50, 45, 127, 221]`).
+/// 2. Supported rates (tag 1) content.
+/// 3. Extended supported rates (tag 50) content.
+/// 4. HT capabilities (tag 45) raw bytes.
+/// 5. Count of vendor-specific (tag 221) IEs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IeFingerprint {
+    /// The ordered sequence of IE tag IDs as they appear in the frame.
+    pub tag_order: Vec<u8>,
+    /// Supported rates IE content (tag 1), if present.
+    pub supported_rates: Option<Vec<u8>>,
+    /// Extended supported rates IE content (tag 50), if present.
+    pub extended_rates: Option<Vec<u8>>,
+    /// HT capabilities IE (tag 45) raw bytes, if present.
+    pub ht_capabilities: Option<Vec<u8>>,
+    /// Number of vendor-specific IEs (tag 221).
+    pub vendor_ie_count: u8,
+    /// A compact 64-bit hash of all the above for fast comparison.
+    pub hash: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,12 +213,14 @@ pub fn parse_probe_request(data: &[u8], dlt: i32) -> Option<ProbeRequest> {
     // Tagged parameters start at offset 24.
     let body = &dot11_data[MGMT_HEADER_LEN..];
     let ssid = parse_ssid_tag(body).unwrap_or_default();
+    let ie_fingerprint = extract_ie_fingerprint(body);
 
     Some(ProbeRequest {
         source_mac,
         ssid,
         signal_dbm,
         channel_freq,
+        ie_fingerprint,
     })
 }
 
@@ -198,6 +241,98 @@ fn parse_ssid_tag(body: &[u8]) -> Option<String> {
         offset += len;
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// IE fingerprinting for device identification despite MAC randomization
+// ---------------------------------------------------------------------------
+
+/// Extract an [`IeFingerprint`] from the tagged-parameter body of a
+/// probe request frame.
+///
+/// This walks every IE in order and collects:
+/// - The tag-ID sequence (critical for fingerprinting — see Martin
+///   et al. WiSec 2016).
+/// - Supported rates (tag 1), extended supported rates (tag 50), and
+///   HT capabilities (tag 45).
+/// - A count of vendor-specific IEs (tag 221).
+///
+/// All of these are hashed into a compact 64-bit value via FNV-1a for
+/// fast lookup and comparison.
+fn extract_ie_fingerprint(body: &[u8]) -> Option<IeFingerprint> {
+    let mut tag_order: Vec<u8> = Vec::new();
+    let mut supported_rates: Option<Vec<u8>> = None;
+    let mut extended_rates: Option<Vec<u8>> = None;
+    let mut ht_capabilities: Option<Vec<u8>> = None;
+    let mut vendor_ie_count: u8 = 0;
+
+    let mut offset = 0;
+    while offset + 2 <= body.len() {
+        let tag = body[offset];
+        let len = body[offset + 1] as usize;
+        offset += 2;
+        if offset + len > body.len() {
+            break;
+        }
+
+        tag_order.push(tag);
+
+        match tag {
+            1 => {
+                supported_rates = Some(body[offset..offset + len].to_vec());
+            }
+            45 => {
+                ht_capabilities = Some(body[offset..offset + len].to_vec());
+            }
+            50 => {
+                extended_rates = Some(body[offset..offset + len].to_vec());
+            }
+            221 => {
+                vendor_ie_count = vendor_ie_count.saturating_add(1);
+            }
+            _ => {}
+        }
+
+        offset += len;
+    }
+
+    if tag_order.is_empty() {
+        return None;
+    }
+
+    // Compute FNV-1a hash over all fingerprint components.
+    let mut hash = fnv1a_hash(&tag_order);
+    if let Some(ref rates) = supported_rates {
+        hash ^= fnv1a_hash(rates);
+    }
+    if let Some(ref ext) = extended_rates {
+        hash ^= fnv1a_hash(ext);
+    }
+    if let Some(ref ht) = ht_capabilities {
+        hash ^= fnv1a_hash(ht);
+    }
+    hash ^= vendor_ie_count as u64;
+
+    Some(IeFingerprint {
+        tag_order,
+        supported_rates,
+        extended_rates,
+        ht_capabilities,
+        vendor_ie_count,
+        hash,
+    })
+}
+
+/// FNV-1a 64-bit hash.  Fast, non-cryptographic, good distribution.
+fn fnv1a_hash(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Format a MAC address as a colon-separated hex string.
@@ -235,5 +370,50 @@ mod tests {
         // Tag 0, length 4, "Test"
         let body = [0x00, 0x04, b'T', b'e', b's', b't'];
         assert_eq!(parse_ssid_tag(&body), Some("Test".to_string()));
+    }
+
+    #[test]
+    fn test_ie_fingerprint_basic() {
+        // SSID tag (0), then Supported Rates tag (1), then HT Caps (45)
+        let body = [
+            0x00, 0x04, b'T', b'e', b's', b't', // Tag 0: SSID "Test"
+            0x01, 0x02, 0x82, 0x84,              // Tag 1: Supported rates
+            0x2D, 0x02, 0xEF, 0x01,              // Tag 45 (0x2D): HT caps
+        ];
+        let fp = extract_ie_fingerprint(&body).unwrap();
+        assert_eq!(fp.tag_order, vec![0, 1, 45]);
+        assert_eq!(fp.supported_rates, Some(vec![0x82, 0x84]));
+        assert_eq!(fp.ht_capabilities, Some(vec![0xEF, 0x01]));
+        assert_eq!(fp.extended_rates, None);
+        assert_eq!(fp.vendor_ie_count, 0);
+    }
+
+    #[test]
+    fn test_ie_fingerprint_same_device_different_ssid() {
+        // Same IEs except SSID content → should have same tag_order
+        let body_a = [
+            0x00, 0x03, b'F', b'o', b'o',
+            0x01, 0x02, 0x82, 0x84,
+        ];
+        let body_b = [
+            0x00, 0x03, b'B', b'a', b'r',
+            0x01, 0x02, 0x82, 0x84,
+        ];
+        let fp_a = extract_ie_fingerprint(&body_a).unwrap();
+        let fp_b = extract_ie_fingerprint(&body_b).unwrap();
+        assert_eq!(fp_a.tag_order, fp_b.tag_order);
+        assert_eq!(fp_a.supported_rates, fp_b.supported_rates);
+    }
+
+    #[test]
+    fn test_ie_fingerprint_vendor_count() {
+        let body = [
+            0x00, 0x01, b'X',                    // SSID
+            0xDD, 0x03, 0x00, 0x50, 0xF2,       // Vendor-specific (221)
+            0xDD, 0x02, 0xAA, 0xBB,             // Another vendor-specific
+        ];
+        let fp = extract_ie_fingerprint(&body).unwrap();
+        assert_eq!(fp.vendor_ie_count, 2);
+        assert_eq!(fp.tag_order, vec![0, 221, 221]);
     }
 }

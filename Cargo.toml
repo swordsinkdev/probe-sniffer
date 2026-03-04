@@ -1,8 +1,8 @@
 [package]
 name = "probe-sniffer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Cross-platform WiFi probe request sniffer with signal-strength-based device clustering"
+description = "Cross-platform WiFi probe request sniffer with signal-strength-based device clustering and multi-card triangulation"
 
 [dependencies]
 pcap = "2.2"

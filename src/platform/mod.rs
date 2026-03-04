@@ -6,6 +6,9 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 use std::io;
 
 /// Trait that each platform module implements.
@@ -30,8 +33,28 @@ pub fn create_monitor() -> Box<dyn WifiMonitor> {
     {
         Box::new(windows::WindowsMonitor::new())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(target_os = "linux")]
     {
-        compile_error!("Unsupported platform — only macOS and Windows are supported");
+        Box::new(linux::LinuxMonitor::new())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        compile_error!("Unsupported platform — only macOS, Windows, and Linux are supported");
+    }
+}
+
+/// Return the actual capture interface name for the given base interface.
+///
+/// On Linux, if a separate monitor VIF was created (e.g. `wlan0mon`), we
+/// need to capture on that instead of the original managed interface.
+/// On other platforms, the base interface is used directly.
+pub fn capture_interface(iface: &str) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        linux::capture_interface(iface)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        iface.to_string()
     }
 }
